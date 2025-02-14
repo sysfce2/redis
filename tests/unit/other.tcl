@@ -75,6 +75,20 @@ start_server {tags {"other"}} {
             r flushall
             assert_equal [s rdb_changes_since_last_save] 0
         }
+
+        test {FLUSHALL and bgsave} {
+            r config set save "3600 1 300 100 60 10000"
+            r set x y
+            r bgsave
+            r set x y
+            r multi
+            r debug sleep 1
+            # by the time we'll get to run flushall, the child will finish,
+            # but the parent will be unaware of it, and it could wrongly set the dirty counter.
+            r flushall
+            r exec
+            assert_equal [s rdb_changes_since_last_save] 0
+        }
     }
 
     test {BGSAVE} {
@@ -124,7 +138,8 @@ start_server {tags {"other"}} {
         if {$::accurate} {set numops 10000} else {set numops 1000}
         test {Check consistency of different data types after a reload} {
             r flushdb
-            createComplexDataset r $numops usetag
+            # TODO: integrate usehexpire following next commit that will support replication
+            createComplexDataset r $numops {usetag usehexpire}
             if {$::ignoredigest} {
                 set _ 1
             } else {
@@ -360,7 +375,7 @@ start_server {tags {"other external:skip"}} {
         r config set save ""
         r config set rdb-key-save-delay 1000000
 
-        populate 4096 "" 1
+        populate 4095 "" 1
         r bgsave
         wait_for_condition 10 100 {
             [s rdb_bgsave_in_progress] eq 1
@@ -375,7 +390,7 @@ start_server {tags {"other external:skip"}} {
         waitForBgsave r
 
         # Hash table should rehash since there is no child process,
-        # size is power of two and over 4098, so it is 8192
+        # size is power of two and over 4096, so it is 8192
         wait_for_condition 50 100 {
             [string match "*table size: 8192*" [r debug HTSTATS 9]]
         } else {
@@ -438,9 +453,9 @@ start_cluster 1 0 {tags {"other external:skip cluster slow"}} {
         }
         assert_match "*table size: 128*" [r debug HTSTATS 0]
 
-        # disable resizing
-        r config set rdb-key-save-delay 10000000
-        r bgsave
+        # disable resizing, the reason for not using slow bgsave is because
+        # it will hit the dict_force_resize_ratio.
+        r debug dict-resizing 0
 
         # delete data to have lot's (96%) of empty buckets
         for {set j 1} {$j <= 123} {incr j} {
@@ -449,13 +464,7 @@ start_cluster 1 0 {tags {"other external:skip cluster slow"}} {
         assert_match "*table size: 128*" [r debug HTSTATS 0]
 
         # enable resizing
-        r config set rdb-key-save-delay 0
-        catch {exec kill -9 [get_child_pid 0]}
-        wait_for_condition 1000 10 {
-            [s rdb_bgsave_in_progress] eq 0
-        } else {
-            fail "bgsave did not stop in time."
-        }
+        r debug dict-resizing 1
 
         # waiting for serverCron to resize the tables
         wait_for_condition 1000 10 {
@@ -474,22 +483,16 @@ start_cluster 1 0 {tags {"other external:skip cluster slow"}} {
             r set "{alice}$j" a
         }
 
-        # disable resizing
-        r config set rdb-key-save-delay 10000000
-        r bgsave
+        # disable resizing, the reason for not using slow bgsave is because
+        # it will hit the dict_force_resize_ratio.
+        r debug dict-resizing 0
 
         for {set j 1} {$j <= 123} {incr j} {
             r del "{alice}$j"
         }
 
         # enable resizing
-        r config set rdb-key-save-delay 0
-        catch {exec kill -9 [get_child_pid 0]}
-        wait_for_condition 1000 10 {
-            [s rdb_bgsave_in_progress] eq 0
-        } else {
-            fail "bgsave did not stop in time."
-        }
+        r debug dict-resizing 1
 
         # waiting for serverCron to resize the tables
         wait_for_condition 1000 10 {
@@ -501,37 +504,29 @@ start_cluster 1 0 {tags {"other external:skip cluster slow"}} {
     } {} {needs:debug}
 }
 
-proc get_overhead_hashtable_main {} {
-    set main 0
-    set stats [r memory stats]
-    set list_stats [split $stats " "]
-    for {set j 0} {$j < [llength $list_stats]} {incr j} {
-        if {[string equal -nocase "\{overhead.hashtable.main" [lindex $list_stats $j]]} {
-            set main [lindex $list_stats [expr $j+1]]
-            break
-        }
-    }
-    return $main
-}
-
 start_server {tags {"other external:skip"}} {
     test "Redis can resize empty dict" {
         # Write and then delete 128 keys, creating an empty dict
         r flushall
+        
+        # Add one key to the db just to create the dict and get its initial size
+        r set x 1
+        set initial_size [dict get [r memory stats] db.9 overhead.hashtable.main] 
+        
+        # Now add 128 keys and then delete them
         for {set j 1} {$j <= 128} {incr j} {
             r set $j{b} a
         }
+        
         for {set j 1} {$j <= 128} {incr j} {
             r del $j{b}
         }
-        # Set a key to enable overhead display of db 0
-        r set a b
-        # The dict containing 128 keys must have expanded,
-        # its hash table itself takes a lot more than 200 bytes
+        
+        # dict must have expanded. Verify it eventually shrinks back to its initial size.
         wait_for_condition 100 50 {
-            [get_overhead_hashtable_main] < 200
+            [dict get [r memory stats] db.9 overhead.hashtable.main] == $initial_size
         } else {
-            fail "dict did not resize in time"
-        }   
+            fail "dict did not resize in time to its initial size"
+        }
     }
 }

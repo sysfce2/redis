@@ -1,3 +1,16 @@
+#
+# Copyright (c) 2009-Present, Redis Ltd.
+# All rights reserved.
+#
+# Copyright (c) 2024-present, Valkey contributors.
+# All rights reserved.
+#
+# Licensed under your choice of the Redis Source Available License 2.0
+# (RSALv2) or the Server Side Public License v1 (SSPLv1).
+#
+# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+#
+
 proc randstring {min max {type binary}} {
     set len [expr {$min+int(rand()*($max-$min+1))}]
     set output {}
@@ -118,11 +131,11 @@ proc wait_for_sync r {
     }
 }
 
-proc wait_replica_online r {
-    wait_for_condition 50 100 {
-        [string match "*slave0:*,state=online*" [$r info replication]]
+proc wait_replica_online {r {replica_id 0} {maxtries 50} {delay 100}} {
+    wait_for_condition $maxtries $delay {
+        [string match "*slave$replica_id:*,state=online*" [$r info replication]]
     } else {
-        fail "replica didn't online in time"
+        fail "replica $replica_id did not become online in time"
     }
 }
 
@@ -293,6 +306,8 @@ proc findKeyWithType {r type} {
 
 proc createComplexDataset {r ops {opt {}}} {
     set useexpire [expr {[lsearch -exact $opt useexpire] != -1}]
+    set usehexpire [expr {[lsearch -exact $opt usehexpire] != -1}]
+
     if {[lsearch -exact $opt usetag] != -1} {
         set tag "{t}"
     } else {
@@ -386,6 +401,10 @@ proc createComplexDataset {r ops {opt {}}} {
             {hash} {
                 randpath {{*}$r hset $k $f $v} \
                         {{*}$r hdel $k $f}
+
+                if { [{*}$r hexists $k $f] && $usehexpire && rand() < 0.5} {
+                    {*}$r hexpire $k 1000 FIELDS 1 $f
+                }
             }
         }
     }
@@ -438,8 +457,14 @@ proc csvdump r {
                 hash {
                     set fields [{*}$r hgetall $k]
                     set newfields {}
-                    foreach {k v} $fields {
-                        lappend newfields [list $k $v]
+                    foreach {f v} $fields {
+                        set expirylist [{*}$r hexpiretime $k FIELDS 1 $f]
+                        if {$expirylist eq (-1)} {
+                            lappend newfields [list $f $v]
+                        } else {
+                            set e [lindex $expirylist 0]
+                            lappend newfields [list $f $e $v] # TODO: extract the actual ttl value from the list in $e
+                        }
                     }
                     set fields [lsort -index 0 $newfields]
                     foreach kv $fields {
@@ -473,8 +498,9 @@ proc find_available_port {start count} {
             set port $start
         }
         set fd1 -1
-        if {[catch {set fd1 [socket -server 127.0.0.1 $port]}] ||
-            [catch {set fd2 [socket -server 127.0.0.1 [expr $port+10000]]}]} {
+        proc dummy_accept {chan addr port} {}
+        if {[catch {set fd1 [socket -server dummy_accept -myaddr 127.0.0.1 $port]}] ||
+            [catch {set fd2 [socket -server dummy_accept -myaddr 127.0.0.1 [expr $port+10000]]}]} {
             if {$fd1 != -1} {
                 close $fd1
             }
@@ -552,10 +578,11 @@ proc find_valgrind_errors {stderr on_termination} {
 }
 
 # Execute a background process writing random data for the specified number
-# of seconds to the specified Redis instance.
-proc start_write_load {host port seconds} {
+# of seconds to the specified Redis instance. If key is omitted, a random key
+# is used for every SET command.
+proc start_write_load {host port seconds {key ""}} {
     set tclsh [info nameofexecutable]
-    exec $tclsh tests/helpers/gen_write_load.tcl $host $port $seconds $::tls &
+    exec $tclsh tests/helpers/gen_write_load.tcl $host $port $seconds $::tls $key &
 }
 
 # Stop a process generating write load executed with start_write_load.
@@ -664,6 +691,12 @@ proc pause_process pid {
 }
 
 proc resume_process pid {
+    wait_for_condition 50 1000 {
+        [string match "T*" [exec ps -o state= -p $pid]]
+    } else {
+        puts [exec ps j $pid]
+        fail "process was not stopped"
+    }
     exec kill -SIGCONT $pid
 }
 
@@ -685,7 +718,17 @@ proc latencyrstat_percentiles {cmd r} {
     }
 }
 
-proc generate_fuzzy_traffic_on_key {key duration} {
+proc get_io_thread_clients {id {client r}} {
+    set pattern "io_thread_$id:clients=(\[0-9\]+)"
+    set info [$client info threads]
+    if {[regexp $pattern $info _ value]} {
+        return $value
+    } else {
+        return -1
+    }
+}
+
+proc generate_fuzzy_traffic_on_key {key type duration} {
     # Commands per type, blocking commands removed
     # TODO: extract these from COMMAND DOCS, and improve to include other types
     set string_commands {APPEND BITCOUNT BITFIELD BITOP BITPOS DECR DECRBY GET GETBIT GETRANGE GETSET INCR INCRBY INCRBYFLOAT MGET MSET MSETNX PSETEX SET SETBIT SETEX SETNX SETRANGE LCS STRLEN}
@@ -696,7 +739,6 @@ proc generate_fuzzy_traffic_on_key {key duration} {
     set stream_commands {XACK XADD XCLAIM XDEL XGROUP XINFO XLEN XPENDING XRANGE XREAD XREADGROUP XREVRANGE XTRIM}
     set commands [dict create string $string_commands hash $hash_commands zset $zset_commands list $list_commands set $set_commands stream $stream_commands]
 
-    set type [r type $key]
     set cmds [dict get $commands $type]
     set start_time [clock seconds]
     set sent {}
@@ -925,6 +967,14 @@ proc wait_for_blocked_clients_count {count {maxtries 100} {delay 10} {idx 0}} {
     }
 }
 
+proc wait_for_watched_clients_count {count {maxtries 100} {delay 10} {idx 0}} {
+    wait_for_condition $maxtries $delay  {
+        [s $idx watching_clients] == $count
+    } else {
+        fail "Timeout waiting for watched clients"
+    }
+}
+
 proc read_from_aof {fp} {
     # Input fp is a blocking binary file descriptor of an opened AOF file.
     if {[gets $fp count] == -1} return ""
@@ -1134,11 +1184,17 @@ proc system_backtrace_supported {} {
 
     # libmusl does not support backtrace. Also return 0 on
     # static binaries (ldd exit code 1) where we can't detect libmusl
-    catch {
-        set ldd [exec ldd src/redis-server]
+    if {![catch {set ldd [exec ldd src/redis-server]}]} {
         if {![string match {*libc.*musl*} $ldd]} {
             return 1
         }
     }
     return 0
+}
+
+proc generate_largevalue_test_array {} {
+    array set largevalue {}
+    set largevalue(listpack) "hello"
+    set largevalue(quicklist) [string repeat "x" 8192]
+    return [array get largevalue]
 }

@@ -5,32 +5,11 @@
  * tables of power of two in size are used, collisions are handled by
  * chaining. See the source code for more information... :)
  *
- * Copyright (c) 2006-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of the Redis Source Available License 2.0
+ * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
 #ifndef __DICT_H
@@ -51,6 +30,7 @@ typedef struct dictEntry dictEntry; /* opaque */
 typedef struct dict dict;
 
 typedef struct dictType {
+    /* Callbacks */
     uint64_t (*hashFunction)(const void *key);
     void *(*keyDup)(dict *d, const void *key);
     void *(*valDup)(dict *d, const void *obj);
@@ -66,18 +46,52 @@ typedef struct dictType {
     /* Allow a dict to carry extra caller-defined metadata. The
      * extra memory is initialized to 0 when a dict is allocated. */
     size_t (*dictMetadataBytes)(dict *d);
+
+    /* Data */
+    void *userdata;
+
     /* Flags */
     /* The 'no_value' flag, if set, indicates that values are not used, i.e. the
      * dict is a set. When this flag is set, it's not possible to access the
-     * value of a dictEntry and it's also impossible to use dictSetKey(). Entry
-     * metadata can also not be used. */
+     * value of a dictEntry and it's also impossible to use dictSetKey(). It 
+     * enables an optimization to store a key directly without an allocating 
+     * dictEntry in between, if it is the only key in the bucket. */
     unsigned int no_value:1;
-    /* If no_value = 1 and all keys are odd (LSB=1), setting keys_are_odd = 1
-     * enables one more optimization: to store a key without an allocated
-     * dictEntry. */
+    /* This flag is required for `no_value` optimization since the optimization
+     * reuses LSB bits as metadata */ 
     unsigned int keys_are_odd:1;
     /* TODO: Add a 'keys_are_even' flag and use a similar optimization if that
      * flag is set. */
+
+    /* Ensures that the entire hash table is rehashed at once if set. */
+    unsigned int force_full_rehash:1;
+
+    /* Sometimes we want the ability to store a key in a given way inside the hash
+     * function, and lookup it in some other way without resorting to any kind of
+     * conversion. For instance the key may be stored as a structure also
+     * representing other things, but the lookup happens via just a pointer to a
+     * null terminated string. Optionally providing additional hash/cmp functions,
+     * dict supports such usage. In that case we'll have a hashFunction() that will
+     * expect a null terminated C string, and a storedHashFunction() that will
+     * instead expect the structure. Similarly, the two comparison functions will
+     * work differently. The keyCompare() will treat the first argument as a pointer
+     * to a C string and the other as a structure (this way we can directly lookup
+     * the structure key using the C string). While the storedKeyCompare() will
+     * check if two pointers to the key in structure form are the same.
+     *
+     * However, functions of dict that gets key as argument (void *key) don't get
+     * any indication whether it is a lookup or stored key. To indicate that
+     * you intend to use key of type stored-key, and, consequently, use
+     * dedicated compare and hash functions of stored-key, is by calling
+     * dictUseStoredKeyApi(1) before using any of the dict functions that gets
+     * key as a parameter and then call again  dictUseStoredKeyApi(0) once done.
+     *
+     * Set to NULL both functions, if you don't want to support this feature. */
+    uint64_t (*storedHashFunction)(const void *key);
+    int (*storedKeyCompare)(dict *d, const void *key1, const void *key2);
+
+    /* Optional callback called when the dict is destroyed. */
+    void (*onDictRelease)(dict *d);
 } dictType;
 
 #define DICTHT_SIZE(exp) ((exp) == -1 ? 0 : (unsigned long)1<<(exp))
@@ -92,7 +106,9 @@ struct dict {
     long rehashidx; /* rehashing not in progress if rehashidx == -1 */
 
     /* Keep small vars at end for optimal (minimal) struct padding */
-    int16_t pauserehash; /* If >0 rehashing is paused (<0 indicates coding error) */
+    unsigned pauserehash : 15; /* If >0 rehashing is paused */
+
+    unsigned useStoredKeyApi : 1; /* See comment of storedHashFunction above */
     signed char ht_size_exp[2]; /* exponent of size. (size = 1<<exp) */
     int16_t pauseAutoResize;  /* If >0 automatic resizing is disallowed (<0 indicates coding error) */
     void *metadata[];
@@ -152,15 +168,16 @@ typedef struct {
 #define dictMetadataSize(d) ((d)->type->dictMetadataBytes \
                              ? (d)->type->dictMetadataBytes(d) : 0)
 
-#define dictHashKey(d, key) ((d)->type->hashFunction(key))
 #define dictBuckets(d) (DICTHT_SIZE((d)->ht_size_exp[0])+DICTHT_SIZE((d)->ht_size_exp[1]))
 #define dictSize(d) ((d)->ht_used[0]+(d)->ht_used[1])
 #define dictIsEmpty(d) ((d)->ht_used[0] == 0 && (d)->ht_used[1] == 0)
 #define dictIsRehashing(d) ((d)->rehashidx != -1)
 #define dictPauseRehashing(d) ((d)->pauserehash++)
 #define dictResumeRehashing(d) ((d)->pauserehash--)
+#define dictIsRehashingPaused(d) ((d)->pauserehash > 0)
 #define dictPauseAutoResize(d) ((d)->pauseAutoResize++)
 #define dictResumeAutoResize(d) ((d)->pauseAutoResize--)
+#define dictUseStoredKeyApi(d, flag) ((d)->useStoredKeyApi = (flag))
 
 /* If our unsigned long type can store a 64 bit number, use a 64 bit PRNG. */
 #if ULONG_MAX >= 0xffffffffffffffff
@@ -177,12 +194,13 @@ typedef enum {
 
 /* API */
 dict *dictCreate(dictType *type);
-dict **dictCreateMultiple(dictType *type, int count);
+void dictTypeAddMeta(dict **d, dictType *typeWithMeta);
 int dictExpand(dict *d, unsigned long size);
 int dictTryExpand(dict *d, unsigned long size);
 int dictShrink(dict *d, unsigned long size);
 int dictAdd(dict *d, void *key, void *val);
 dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing);
+dictEntry *dictAddNonExistsByHash(dict *d, void *key, const uint64_t hash);
 void *dictFindPositionForInsert(dict *d, const void *key, dictEntry **existing);
 dictEntry *dictInsertAtPosition(dict *d, void *key, void *position);
 dictEntry *dictAddOrFind(dict *d, void *key);
@@ -194,6 +212,8 @@ dictEntry *dictTwoPhaseUnlinkFind(dict *d, const void *key, dictEntry ***plink, 
 void dictTwoPhaseUnlinkFree(dict *d, dictEntry *he, dictEntry **plink, int table_index);
 void dictRelease(dict *d);
 dictEntry * dictFind(dict *d, const void *key);
+dictEntry *dictFindByHash(dict *d, const void *key, const uint64_t hash);
+dictEntry *dictFindByHashAndPtr(dict *d, const void *oldptr, const uint64_t hash);
 void *dictFetchValue(dict *d, const void *key);
 int dictShrinkIfNeeded(dict *d);
 int dictExpandIfNeeded(dict *d);
@@ -236,13 +256,24 @@ uint8_t *dictGetHashFunctionSeed(void);
 unsigned long dictScan(dict *d, unsigned long v, dictScanFunction *fn, void *privdata);
 unsigned long dictScanDefrag(dict *d, unsigned long v, dictScanFunction *fn, dictDefragFunctions *defragfns, void *privdata);
 uint64_t dictGetHash(dict *d, const void *key);
-dictEntry *dictFindEntryByPtrAndHash(dict *d, const void *oldptr, uint64_t hash);
 void dictRehashingInfo(dict *d, unsigned long long *from_size, unsigned long long *to_size);
 
 size_t dictGetStatsMsg(char *buf, size_t bufsize, dictStats *stats, int full);
 dictStats* dictGetStatsHt(dict *d, int htidx, int full);
 void dictCombineStats(dictStats *from, dictStats *into);
 void dictFreeStats(dictStats *stats);
+
+#define dictForEach(d, ty, m, ...) do { \
+    dictIterator *di = dictGetIterator(d); \
+    dictEntry *de; \
+    while ((de = dictNext(di)) != NULL) { \
+        ty *m = dictGetVal(de); \
+        do { \
+            __VA_ARGS__ \
+        } while(0); \
+    } \
+    dictReleaseIterator(di); \
+} while(0);
 
 #ifdef REDIS_TEST
 int dictTest(int argc, char *argv[], int flags);

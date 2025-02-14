@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2014, Matt Stancliff <matt@genges.com>.
- * Copyright (c) 2015-2016, Salvatore Sanfilippo <antirez@gmail.com>.
+ * Copyright (c) 2015-current, Redis Ltd.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -796,8 +796,8 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
 
             if (withcoords) {
                 addReplyArrayLen(c, 2);
-                addReplyHumanLongDouble(c, gp->longitude);
-                addReplyHumanLongDouble(c, gp->latitude);
+                addReplyDouble(c,gp->longitude);
+                addReplyDouble(c,gp->latitude);
             }
         }
     } else {
@@ -959,8 +959,8 @@ void geoposCommand(client *c) {
                 continue;
             }
             addReplyArrayLen(c,2);
-            addReplyHumanLongDouble(c,xy[0]);
-            addReplyHumanLongDouble(c,xy[1]);
+            addReplyDouble(c,xy[0]);
+            addReplyDouble(c,xy[1]);
         }
     }
 }

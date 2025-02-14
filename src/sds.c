@@ -1,33 +1,10 @@
 /* SDSLib 2.0 -- A C dynamic strings library
  *
- * Copyright (c) 2006-2015, Salvatore Sanfilippo <antirez at gmail dot com>
- * Copyright (c) 2015, Oran Agra
- * Copyright (c) 2015, Redis Labs, Inc
+ * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of the Redis Source Available License 2.0
+ * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
 #include <stdio.h>
@@ -195,6 +172,11 @@ sds sdsdup(const sds s) {
 void sdsfree(sds s) {
     if (s == NULL) return;
     s_free((char*)s-sdsHdrSize(s[-1]));
+}
+
+/* Generic version of sdsfree. */
+void sdsfreegeneric(void *s) {
+    sdsfree((sds)s);
 }
 
 /* Set the sds string length to the length as obtained with strlen(), so
@@ -1466,29 +1448,29 @@ int sdsTest(int argc, char **argv, int flags) {
         /* Test sdsresize - extend */
         x = sdsnew("1234567890123456789012345678901234567890");
         x = sdsResize(x, 200, 1);
-        test_cond("sdsrezie() expand len", sdslen(x) == 40);
-        test_cond("sdsrezie() expand strlen", strlen(x) == 40);
-        test_cond("sdsrezie() expand alloc", sdsalloc(x) == 200);
+        test_cond("sdsresize() expand len", sdslen(x) == 40);
+        test_cond("sdsresize() expand strlen", strlen(x) == 40);
+        test_cond("sdsresize() expand alloc", sdsalloc(x) == 200);
         /* Test sdsresize - trim free space */
         x = sdsResize(x, 80, 1);
-        test_cond("sdsrezie() shrink len", sdslen(x) == 40);
-        test_cond("sdsrezie() shrink strlen", strlen(x) == 40);
-        test_cond("sdsrezie() shrink alloc", sdsalloc(x) == 80);
+        test_cond("sdsresize() shrink len", sdslen(x) == 40);
+        test_cond("sdsresize() shrink strlen", strlen(x) == 40);
+        test_cond("sdsresize() shrink alloc", sdsalloc(x) == 80);
         /* Test sdsresize - crop used space */
         x = sdsResize(x, 30, 1);
-        test_cond("sdsrezie() crop len", sdslen(x) == 30);
-        test_cond("sdsrezie() crop strlen", strlen(x) == 30);
-        test_cond("sdsrezie() crop alloc", sdsalloc(x) == 30);
+        test_cond("sdsresize() crop len", sdslen(x) == 30);
+        test_cond("sdsresize() crop strlen", strlen(x) == 30);
+        test_cond("sdsresize() crop alloc", sdsalloc(x) == 30);
         /* Test sdsresize - extend to different class */
         x = sdsResize(x, 400, 1);
-        test_cond("sdsrezie() expand len", sdslen(x) == 30);
-        test_cond("sdsrezie() expand strlen", strlen(x) == 30);
-        test_cond("sdsrezie() expand alloc", sdsalloc(x) == 400);
+        test_cond("sdsresize() expand len", sdslen(x) == 30);
+        test_cond("sdsresize() expand strlen", strlen(x) == 30);
+        test_cond("sdsresize() expand alloc", sdsalloc(x) == 400);
         /* Test sdsresize - shrink to different class */
         x = sdsResize(x, 4, 1);
-        test_cond("sdsrezie() crop len", sdslen(x) == 4);
-        test_cond("sdsrezie() crop strlen", strlen(x) == 4);
-        test_cond("sdsrezie() crop alloc", sdsalloc(x) == 4);
+        test_cond("sdsresize() crop len", sdslen(x) == 4);
+        test_cond("sdsresize() crop strlen", strlen(x) == 4);
+        test_cond("sdsresize() crop alloc", sdsalloc(x) == 4);
         sdsfree(x);
     }
     return 0;

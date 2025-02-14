@@ -2,32 +2,11 @@
  *
  * ----------------------------------------------------------------------------
  *
- * Copyright (c) 2009-2016, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of the Redis Source Available License 2.0
+ * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
 #include "server.h"
@@ -57,17 +36,18 @@ static double avg_ttl_factor[16] = {0.98, 0.9604, 0.941192, 0.922368, 0.903921, 
  * to the function to avoid too many gettimeofday() syscalls. */
 int activeExpireCycleTryExpire(redisDb *db, dictEntry *de, long long now) {
     long long t = dictGetSignedIntegerVal(de);
-    if (now > t) {
-        enterExecutionUnit(1, 0);
-        sds key = dictGetKey(de);
-        robj *keyobj = createStringObject(key,sdslen(key));
-        deleteExpiredKeyAndPropagate(db,keyobj);
-        decrRefCount(keyobj);
-        exitExecutionUnit();
-        return 1;
-    } else {
+    if (now < t)
         return 0;
-    }
+
+    enterExecutionUnit(1, 0);
+    sds key = dictGetKey(de);
+    robj *keyobj = createStringObject(key,sdslen(key));
+    deleteExpiredKeyAndPropagate(db,keyobj);
+    decrRefCount(keyobj);
+    exitExecutionUnit();
+    /* Propagate the DEL command */
+    postExecutionUnitOperations();
+    return 1;
 }
 
 /* Try to expire a few timed out keys. The algorithm used is adaptive and
@@ -116,6 +96,8 @@ int activeExpireCycleTryExpire(redisDb *db, dictEntry *de, long long now) {
 #define ACTIVE_EXPIRE_CYCLE_ACCEPTABLE_STALE 10 /* % of stale keys after which
                                                    we do extra efforts. */
 
+#define HFE_DB_BASE_ACTIVE_EXPIRE_FIELDS_PER_SEC 10000
+
 /* Data used by the expire dict scan callback. */
 typedef struct {
     redisDb *db;
@@ -132,8 +114,6 @@ void expireScanCallback(void *privdata, const dictEntry *const_de) {
     long long ttl  = dictGetSignedIntegerVal(de) - data->now;
     if (activeExpireCycleTryExpire(data->db, de, data->now)) {
         data->expired++;
-        /* Propagate the DEL command */
-        postExecutionUnitOperations();
     }
     if (ttl > 0) {
         /* We want the average TTL of keys yet not expired. */
@@ -153,6 +133,54 @@ static inline int isExpiryDictValidForSamplingCb(dict *d) {
         return C_ERR;
     }
     return C_OK;
+}
+
+/* Active expiration Cycle for hash-fields.
+ *
+ * Note that releasing fields is expected to be more predictable and rewarding
+ * than releasing keys because it is stored in `ebuckets` DS which optimized for
+ * active expiration and in addition the deletion of fields is simple to handle. */
+static inline void activeExpireHashFieldCycle(int type) {
+    /* Remember current db across calls */
+    static unsigned int currentDb = 0;
+
+    /* Tracks the count of fields actively expired for the current database.
+     * This count continues as long as it fails to actively expire all expired
+     * fields of currentDb, indicating a possible need to adjust the value of
+     * maxToExpire. */
+    static uint64_t activeExpirySequence = 0;
+    /* Threshold for adjusting maxToExpire */
+    const uint32_t EXPIRED_FIELDS_TH = 1000000;
+
+    redisDb *db = server.db + currentDb;
+
+    /* If db is empty, move to next db and return */
+    if (ebIsEmpty(db->hexpires)) {
+        activeExpirySequence = 0;
+        currentDb = (currentDb + 1) % server.dbnum;
+        return;
+    }
+
+    /* Maximum number of fields to actively expire on a single call */
+    uint32_t maxToExpire = HFE_DB_BASE_ACTIVE_EXPIRE_FIELDS_PER_SEC / server.hz;
+
+    /* If running for a while and didn't manage to active-expire all expired fields of
+     * currentDb (i.e. activeExpirySequence becomes significant) then adjust maxToExpire */
+    if ((activeExpirySequence > EXPIRED_FIELDS_TH) && (type == ACTIVE_EXPIRE_CYCLE_SLOW)) {
+        /* maxToExpire is multiplied by a factor between 1 and 32, proportional to
+         * the number of times activeExpirySequence exceeded EXPIRED_FIELDS_TH */
+        uint64_t factor = activeExpirySequence / EXPIRED_FIELDS_TH;
+        maxToExpire *= (factor<32) ? factor : 32;
+    }
+
+    if (hashTypeDbActiveExpire(db, maxToExpire) == maxToExpire) {
+        /* active-expire reached maxToExpire limit */
+        activeExpirySequence += maxToExpire;
+    } else {
+        /* Managed to active-expire all expired fields of currentDb */
+        activeExpirySequence = 0;
+        currentDb = (currentDb + 1) % server.dbnum;
+    }
 }
 
 void activeExpireCycle(int type) {
@@ -245,6 +273,7 @@ void activeExpireCycle(int type) {
         redisDb *db = server.db+(current_db % server.dbnum);
         data.db = db;
 
+        int db_done = 0; /* The scan of the current DB is done? */
         int update_avg_ttl_times = 0, repeat = 0;
 
         /* Increment the DB now so we are sure if we run out of time
@@ -252,7 +281,13 @@ void activeExpireCycle(int type) {
          * distribute the time evenly across DBs. */
         current_db++;
 
-        if (dbSize(db, DB_EXPIRES)) dbs_performed++;
+        /* Interleaving hash-field expiration with key expiration. Better
+         * call it before handling expired keys because HFE DS is optimized for
+         * active expiration */
+        activeExpireHashFieldCycle(type);
+
+        if (kvstoreSize(db->expires))
+            dbs_performed++;
 
         /* Continue to expire if at the end of the cycle there are still
          * a big percentage of keys to expire, compared to the number of keys
@@ -263,7 +298,7 @@ void activeExpireCycle(int type) {
             iteration++;
 
             /* If there is nothing to expire try next DB ASAP. */
-            if ((num = dbSize(db, DB_EXPIRES)) == 0) {
+            if ((num = kvstoreSize(db->expires)) == 0) {
                 db->avg_ttl = 0;
                 break;
             }
@@ -293,8 +328,9 @@ void activeExpireCycle(int type) {
             int origin_ttl_samples = data.ttl_samples;
 
             while (data.sampled < num && checked_buckets < max_buckets) {
-                db->expires_cursor = dbScan(db, DB_EXPIRES, db->expires_cursor, -1, expireScanCallback, isExpiryDictValidForSamplingCb, &data);
+                db->expires_cursor = kvstoreScan(db->expires, db->expires_cursor, -1, expireScanCallback, isExpiryDictValidForSamplingCb, &data);
                 if (db->expires_cursor == 0) {
+                    db_done = 1;
                     break;
                 }
                 checked_buckets++;
@@ -305,7 +341,11 @@ void activeExpireCycle(int type) {
             /* If find keys with ttl not yet expired, we need to update the average TTL stats once. */
             if (data.ttl_samples - origin_ttl_samples > 0) update_avg_ttl_times++;
 
-            repeat = data.sampled == 0 || (data.expired * 100 / data.sampled) > config_cycle_acceptable_stale;
+            /* We don't repeat the cycle for the current database if the db is done
+             * for scanning or an acceptable number of stale keys (logically expired
+             * but yet not reclaimed). */
+            repeat = db_done ? 0 : (data.sampled == 0 || (data.expired * 100 / data.sampled) > config_cycle_acceptable_stale);
+
             /* We can't block forever here even if there are many keys to
              * expire. So after a given amount of microseconds return to the
              * caller waiting for the other active expire cycle. */
@@ -321,7 +361,7 @@ void activeExpireCycle(int type) {
                     if (db->avg_ttl == 0) {
                         db->avg_ttl = avg_ttl;
                     } else {
-                        /* Thr origin code is as follow.
+                        /* The origin code is as follow.
                          * for (int i = 0; i < update_avg_ttl_times; i++) {
                          *   db->avg_ttl = (db->avg_ttl/50)*49 + (avg_ttl/50);
                          * } 
@@ -348,9 +388,6 @@ void activeExpireCycle(int type) {
                     }
                 }
             }
-            /* We don't repeat the cycle for the current database if there are
-             * an acceptable amount of stale keys (logically expired but yet
-             * not reclaimed). */
         } while (repeat);
     }
 
@@ -426,17 +463,8 @@ void expireSlaveKeys(void) {
         while(dbids && dbid < server.dbnum) {
             if ((dbids & 1) != 0) {
                 redisDb *db = server.db+dbid;
-                dictEntry *expire = dictFind(db->expires[getKeySlot(keyname)],keyname);
-                int expired = 0;
-
-                if (expire &&
-                    activeExpireCycleTryExpire(server.db+dbid,expire,start))
-                {
-                    expired = 1;
-                    /* Propagate the DEL (writable replicas do not propagate anything to other replicas,
-                     * but they might propagate to AOF) and trigger module hooks. */
-                    postExecutionUnitOperations();
-                }
+                dictEntry *expire = dbFindExpires(db, keyname);
+                int expired = expire && activeExpireCycleTryExpire(server.db+dbid,expire,start);
 
                 /* If the key was not expired in this DB, we need to set the
                  * corresponding bit in the new bitmap we set as value.

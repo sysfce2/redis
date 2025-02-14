@@ -1,33 +1,13 @@
 /*
- * Copyright (c) 2018, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2018-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of the Redis Source Available License 2.0
+ * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
 #include "server.h"
+#include "cluster.h"
 #include "sha256.h"
 #include <fcntl.h>
 #include <ctype.h>
@@ -298,7 +278,7 @@ int ACLListMatchSds(void *a, void *b) {
 
 /* Method to free list elements from ACL users password/patterns lists. */
 void ACLListFreeSds(void *item) {
-    sdsfree(item);
+    sdsfreegeneric(item);
 }
 
 /* Method to duplicate list elements from ACL users password/patterns lists. */
@@ -490,6 +470,11 @@ void ACLFreeUser(user *u) {
     zfree(u);
 }
 
+/* Generic version of ACLFreeUser. */
+void ACLFreeUserGeneric(void *u) {
+    ACLFreeUser((user *)u);
+}
+
 /* When a user is deleted we need to cycle the active
  * connections in order to kill all the pending ones that
  * are authenticated with such user. */
@@ -506,15 +491,7 @@ void ACLFreeUserAndKillClients(user *u) {
              * this may result in some security hole: it's much
              * more defensive to set the default user and put
              * it in non authenticated mode. */
-            c->user = DefaultUser;
-            c->authenticated = 0;
-            /* We will write replies to this client later, so we can't
-             * close it directly even if async. */
-            if (c == server.current_client) {
-                c->flags |= CLIENT_CLOSE_AFTER_COMMAND;
-            } else {
-                freeClientAsync(c);
-            }
+            deauthenticateAndCloseClient(c);
         }
     }
     ACLFreeUser(u);
@@ -1090,6 +1067,7 @@ int ACLSetSelector(aclSelector *selector, const char* op, size_t oplen) {
         int flags = 0;
         size_t offset = 1;
         if (op[0] == '%') {
+            int perm_ok = 1;
             for (; offset < oplen; offset++) {
                 if (toupper(op[offset]) == 'R' && !(flags & ACL_READ_PERMISSION)) {
                     flags |= ACL_READ_PERMISSION;
@@ -1099,9 +1077,13 @@ int ACLSetSelector(aclSelector *selector, const char* op, size_t oplen) {
                     offset++;
                     break;
                 } else {
-                    errno = EINVAL;
-                    return C_ERR;
+                    perm_ok = 0;
+                    break;
                 }
+            }
+            if (!flags || !perm_ok) {
+                errno = EINVAL;
+                return C_ERR;
             }
         } else {
             flags = ACL_ALL_PERMISSION;
@@ -1606,14 +1588,22 @@ static int ACLSelectorCheckKey(aclSelector *selector, const char *key, int keyle
     if (keyspec_flags & CMD_KEY_DELETE) key_flags |= ACL_WRITE_PERMISSION;
     if (keyspec_flags & CMD_KEY_UPDATE) key_flags |= ACL_WRITE_PERMISSION;
 
+    /* Is given key represent a prefix of a set of keys */
+    int prefix = keyspec_flags & CMD_KEY_PREFIX;
+
     /* Test this key against every pattern. */
     while((ln = listNext(&li))) {
         keyPattern *pattern = listNodeValue(ln);
         if ((pattern->flags & key_flags) != key_flags)
             continue;
         size_t plen = sdslen(pattern->pattern);
-        if (stringmatchlen(pattern->pattern,plen,key,keylen,0))
-            return ACL_OK;
+        if (prefix) {
+            if (prefixmatch(pattern->pattern,plen,key,keylen,0))
+                return ACL_OK;
+        } else {
+            if (stringmatchlen(pattern->pattern, plen, key, keylen, 0))
+                return ACL_OK;
+        }
     }
     return ACL_DENIED_KEY;
 }
@@ -1903,12 +1893,6 @@ int ACLCheckAllPerm(client *c, int *idxptr) {
     return ACLCheckAllUserCommandPerm(c->user, c->cmd, c->argv, c->argc, idxptr);
 }
 
-int totalSubscriptions(void) {
-    return dictSize(server.pubsub_patterns) +
-           dictSize(server.pubsub_channels) +
-           server.shard_channel_count;
-}
-
 /* If 'new' can access all channels 'original' could then return NULL;
    Otherwise return a list of channels that the new user can access */
 list *getUpcomingChannelList(user *new, user *original) {
@@ -2017,7 +2001,7 @@ int ACLShouldKillPubsubClient(client *c, list *upcoming) {
  * permissions specified via the upcoming argument, and kill them if so. */
 void ACLKillPubsubClientsIfNeeded(user *new, user *original) {
     /* Do nothing if there are no subscribers. */
-    if (totalSubscriptions() == 0)
+    if (pubsubTotalSubscriptions() == 0)
         return;
 
     list *channels = getUpcomingChannelList(new, original);
@@ -2037,7 +2021,7 @@ void ACLKillPubsubClientsIfNeeded(user *new, user *original) {
         if (c->user != original)
             continue;
         if (ACLShouldKillPubsubClient(c, channels))
-            freeClient(c);
+            deauthenticateAndCloseClient(c);
     }
 
     listRelease(channels);
@@ -2450,7 +2434,7 @@ sds ACLLoadFromFile(const char *filename) {
 
         /* If there are some subscribers, we need to check if we need to drop some clients. */
         rax *user_channels = NULL;
-        if (totalSubscriptions() > 0) {
+        if (pubsubTotalSubscriptions() > 0) {
             user_channels = raxNew();
         }
 
@@ -2460,6 +2444,9 @@ sds ACLLoadFromFile(const char *filename) {
         listRewind(server.clients,&li);
         while ((ln = listNext(&li)) != NULL) {
             client *c = listNodeValue(ln);
+            /* a MASTER client can do everything (and user = NULL) so we can skip it */
+            if (c->flags & CLIENT_MASTER)
+                continue;
             user *original = c->user;
             list *channels = NULL;
             user *new = ACLGetUserByName(c->user->name, sdslen(c->user->name));
@@ -2471,19 +2458,19 @@ sds ACLLoadFromFile(const char *filename) {
             }
             /* When the new channel list is NULL, it means the new user's channel list is a superset of the old user's list. */
             if (!new || (channels && ACLShouldKillPubsubClient(c, channels))) {
-                freeClient(c);
+                deauthenticateAndCloseClient(c);
                 continue;
             }
             c->user = new;
         }
 
         if (user_channels)
-            raxFreeWithCallback(user_channels, (void(*)(void*))listRelease);
-        raxFreeWithCallback(old_users,(void(*)(void*))ACLFreeUser);
+            raxFreeWithCallback(user_channels, listReleaseGeneric);
+        raxFreeWithCallback(old_users, ACLFreeUserGeneric);
         sdsfree(errors);
         return NULL;
     } else {
-        raxFreeWithCallback(Users,(void(*)(void*))ACLFreeUser);
+        raxFreeWithCallback(Users, ACLFreeUserGeneric);
         Users = old_users;
         errors = sdscat(errors,"WARNING: ACL errors detected, no change to the previously active ACL rules was performed");
         return errors;
@@ -2794,7 +2781,6 @@ void aclCatWithFlags(client *c, dict *commands, uint64_t cflag, int *arraylen) {
 
     while ((de = dictNext(di)) != NULL) {
         struct redisCommand *cmd = dictGetVal(de);
-        if (cmd->flags & CMD_MODULE) continue;
         if (cmd->acl_categories & cflag) {
             addReplyBulkCBuffer(c, cmd->fullname, sdslen(cmd->fullname));
             (*arraylen)++;
@@ -3209,6 +3195,38 @@ void addReplyCommandCategories(client *c, struct redisCommand *cmd) {
     setDeferredSetLen(c, flaglen, flagcount);
 }
 
+/* When successful, initiates an internal connection, that is able to execute
+ * internal commands (see CMD_INTERNAL). */
+static void internalAuth(client *c) {
+    if (server.cluster == NULL) {
+        addReplyError(c, "Cannot authenticate as an internal connection on non-cluster instances");
+        return;
+    }
+
+    sds password = c->argv[2]->ptr;
+
+    /* Get internal secret. */
+    size_t len = -1;
+    const char *internal_secret = clusterGetSecret(&len);
+    if (sdslen(password) != len) {
+        addReplyError(c, "-WRONGPASS invalid internal password");
+        return;
+    }
+    if (!time_independent_strcmp((char *)internal_secret, (char *)password, len)) {
+        c->flags |= CLIENT_INTERNAL;
+        /* No further authentication is needed. */
+        c->authenticated = 1;
+        /* Set the user to the unrestricted user, if it is not already set (default). */
+        if (c->user != NULL) {
+            c->user = NULL;
+            moduleNotifyUserChanged(c);
+        }
+        addReply(c, shared.ok);
+    } else {
+        addReplyError(c, "-WRONGPASS invalid internal password");
+    }
+}
+
 /* AUTH <password>
  * AUTH <username> <password> (Redis >= 6.0 form)
  *
@@ -3242,6 +3260,14 @@ void authCommand(client *c) {
         username = c->argv[1];
         password = c->argv[2];
         redactClientCommandArgument(c, 2);
+
+        /* Handle internal authentication commands.
+         * Note: No user-defined ACL user can have this username (no spaces
+         * allowed), thus no conflicts with ACL possible. */
+        if (!strcmp(username->ptr, "internal connection")) {
+            internalAuth(c);
+            return;
+        }
     }
 
     robj *err = NULL;

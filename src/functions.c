@@ -1,30 +1,9 @@
 /*
- * Copyright (c) 2021, Redis Ltd.
+ * Copyright (c) 2011-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of the Redis Source Available License 2.0
+ * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
 #include "functions.h"
@@ -45,6 +24,7 @@ static size_t engine_cache_memory = 0;
 static void engineFunctionDispose(dict *d, void *obj);
 static void engineStatsDispose(dict *d, void *obj);
 static void engineLibraryDispose(dict *d, void *obj);
+static void engineDispose(dict *d, void *obj);
 static int functionsVerifyName(sds name);
 
 typedef struct functionsLibEngineStats {
@@ -71,7 +51,7 @@ dictType engineDictType = {
         NULL,                  /* val dup */
         dictSdsKeyCaseCompare, /* key compare */
         dictSdsDestructor,     /* key destructor */
-        NULL,                  /* val destructor */
+        engineDispose,         /* val destructor */
         NULL                   /* allow to expand */
 };
 
@@ -164,9 +144,23 @@ static void engineLibraryFree(functionLibInfo* li) {
     zfree(li);
 }
 
+static void engineLibraryFreeGeneric(void *li) {
+    engineLibraryFree((functionLibInfo *)li);
+}
+
 static void engineLibraryDispose(dict *d, void *obj) {
     UNUSED(d);
     engineLibraryFree(obj);
+}
+
+static void engineDispose(dict *d, void *obj) {
+    UNUSED(d);
+    engineInfo *ei = obj;
+    freeClient(ei->c);
+    sdsfree(ei->name);
+    ei->engine->free_ctx(ei->engine->engine_ctx);
+    zfree(ei->engine);
+    zfree(ei);
 }
 
 /* Clear all the functions from the given library ctx */
@@ -181,17 +175,19 @@ void functionsLibCtxClear(functionsLibCtx *lib_ctx) {
         stats->n_lib = 0;
     }
     dictReleaseIterator(iter);
-    curr_functions_lib_ctx->cache_memory = 0;
+    lib_ctx->cache_memory = 0;
 }
 
 void functionsLibCtxClearCurrent(int async) {
     if (async) {
         functionsLibCtx *old_l_ctx = curr_functions_lib_ctx;
-        curr_functions_lib_ctx = functionsLibCtxCreate();
-        freeFunctionsAsync(old_l_ctx);
+        dict *old_engines = engines;
+        freeFunctionsAsync(old_l_ctx, old_engines);
     } else {
-        functionsLibCtxClear(curr_functions_lib_ctx);
+        functionsLibCtxFree(curr_functions_lib_ctx);
+        dictRelease(engines);
     }
+    functionsInit();
 }
 
 /* Free the given functions ctx */
@@ -346,7 +342,7 @@ static int libraryJoin(functionsLibCtx *functions_lib_ctx_dst, functionsLibCtx *
             } else {
                 if (!old_libraries_list) {
                     old_libraries_list = listCreate();
-                    listSetFreeMethod(old_libraries_list, (void (*)(void*))engineLibraryFree);
+                    listSetFreeMethod(old_libraries_list, engineLibraryFreeGeneric);
                 }
                 libraryUnlink(functions_lib_ctx_dst, old_li);
                 listAddNodeTail(old_libraries_list, old_li);
@@ -1071,7 +1067,7 @@ void functionLoadCommand(client *c) {
 }
 
 /* Return memory usage of all the engines combine */
-unsigned long functionsMemory(void) {
+unsigned long functionsMemoryVM(void) {
     dictIterator *iter = dictGetIterator(engines);
     dictEntry *entry = NULL;
     size_t engines_memory = 0;
@@ -1086,7 +1082,7 @@ unsigned long functionsMemory(void) {
 }
 
 /* Return memory overhead of all the engines combine */
-unsigned long functionsMemoryOverhead(void) {
+unsigned long functionsMemoryEngine(void) {
     size_t memory_overhead = dictMemUsage(engines);
     memory_overhead += dictMemUsage(curr_functions_lib_ctx->functions);
     memory_overhead += sizeof(functionsLibCtx);

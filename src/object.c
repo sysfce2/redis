@@ -1,31 +1,10 @@
 /* Redis Object implementation.
  *
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of the Redis Source Available License 2.0
+ * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
 #include "server.h"
@@ -232,8 +211,8 @@ robj *dupStringObject(const robj *o) {
     }
 }
 
-robj *createQuicklistObject(void) {
-    quicklist *l = quicklistCreate();
+robj *createQuicklistObject(int fill, int compress) {
+    quicklist *l = quicklistNew(fill, compress);
     robj *o = createObject(OBJ_LIST,l);
     o->encoding = OBJ_ENCODING_QUICKLIST;
     return o;
@@ -354,17 +333,7 @@ void freeZsetObject(robj *o) {
 }
 
 void freeHashObject(robj *o) {
-    switch (o->encoding) {
-    case OBJ_ENCODING_HT:
-        dictRelease((dict*) o->ptr);
-        break;
-    case OBJ_ENCODING_LISTPACK:
-        lpFree(o->ptr);
-        break;
-    default:
-        serverPanic("Unknown hash encoding type");
-        break;
-    }
+    hashTypeFree(o);
 }
 
 void freeModuleObject(robj *o) {
@@ -523,6 +492,9 @@ void dismissHashObject(robj *o, size_t size_hint) {
         dismissMemory(d->ht_table[1], DICTHT_SIZE(d->ht_size_exp[1])*sizeof(dictEntry*));
     } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
         dismissMemory(o->ptr, lpBytes((unsigned char*)o->ptr));
+    } else if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
+        listpackEx *lpt = o->ptr;
+        dismissMemory(lpt->lp, lpBytes((unsigned char*)lpt->lp));
     } else {
         serverPanic("Unknown hash encoding type");
     }
@@ -706,6 +678,18 @@ robj *tryObjectEncodingEx(robj *o, int try_trim) {
 
 robj *tryObjectEncoding(robj *o) {
     return tryObjectEncodingEx(o, 1);
+}
+
+size_t getObjectLength(robj *o) {
+    switch(o->type) {
+        case OBJ_STRING: return stringObjectLen(o);
+        case OBJ_LIST: return listTypeLength(o);
+        case OBJ_SET: return setTypeSize(o);
+        case OBJ_ZSET: return zsetLength(o);
+        case OBJ_HASH: return hashTypeLength(o, 0);
+        case OBJ_STREAM: return streamLength(o);
+        default: return 0;
+    }
 }
 
 /* Get a decoded version of an encoded object (returned as a new object).
@@ -960,6 +944,7 @@ char *strEncoding(int encoding) {
     case OBJ_ENCODING_HT: return "hashtable";
     case OBJ_ENCODING_QUICKLIST: return "quicklist";
     case OBJ_ENCODING_LISTPACK: return "listpack";
+    case OBJ_ENCODING_LISTPACK_EX: return "listpackex";
     case OBJ_ENCODING_INTSET: return "intset";
     case OBJ_ENCODING_SKIPLIST: return "skiplist";
     case OBJ_ENCODING_EMBSTR: return "embstr";
@@ -1000,11 +985,10 @@ size_t streamRadixTreeMemoryUsage(rax *rax) {
  * are checked and averaged to estimate the total size. */
 #define OBJ_COMPUTE_SIZE_DEF_SAMPLES 5 /* Default sample size. */
 size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
-    sds ele, ele2;
     dict *d;
     dictIterator *di;
     struct dictEntry *de;
-    size_t asize = 0, elesize = 0, samples = 0;
+    size_t asize = 0, elesize = 0, elecount = 0, samples = 0;
 
     if (o->type == OBJ_STRING) {
         if(o->encoding == OBJ_ENCODING_INT) {
@@ -1023,9 +1007,10 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
             asize = sizeof(*o)+sizeof(quicklist);
             do {
                 elesize += sizeof(quicklistNode)+zmalloc_size(node->entry);
+                elecount += node->count;
                 samples++;
             } while ((node = node->next) && samples < sample_size);
-            asize += (double)elesize/samples*ql->len;
+            asize += (double)elesize/elecount*ql->count;
         } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
             asize = sizeof(*o)+zmalloc_size(o->ptr);
         } else {
@@ -1037,7 +1022,7 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
             di = dictGetIterator(d);
             asize = sizeof(*o)+sizeof(dict)+(sizeof(struct dictEntry*)*dictBuckets(d));
             while((de = dictNext(di)) != NULL && samples < sample_size) {
-                ele = dictGetKey(de);
+                sds ele = dictGetKey(de);
                 elesize += dictEntryMemUsage() + sdsZmallocSize(ele);
                 samples++;
             }
@@ -1073,14 +1058,17 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
     } else if (o->type == OBJ_HASH) {
         if (o->encoding == OBJ_ENCODING_LISTPACK) {
             asize = sizeof(*o)+zmalloc_size(o->ptr);
+        } else if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
+            listpackEx *lpt = o->ptr;
+            asize = sizeof(*o) + zmalloc_size(lpt) + zmalloc_size(lpt->lp);
         } else if (o->encoding == OBJ_ENCODING_HT) {
             d = o->ptr;
             di = dictGetIterator(d);
             asize = sizeof(*o)+sizeof(dict)+(sizeof(struct dictEntry*)*dictBuckets(d));
             while((de = dictNext(di)) != NULL && samples < sample_size) {
-                ele = dictGetKey(de);
-                ele2 = dictGetVal(de);
-                elesize += sdsZmallocSize(ele) + sdsZmallocSize(ele2);
+                hfield ele = dictGetKey(de);
+                sds ele2 = dictGetVal(de);
+                elesize += hfieldZmallocSize(ele) + sdsZmallocSize(ele2);
                 elesize += dictEntryMemUsage();
                 samples++;
             }
@@ -1183,10 +1171,15 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
         (float)server.cron_malloc_stats.process_rss / server.cron_malloc_stats.zmalloc_used;
     mh->total_frag_bytes =
         server.cron_malloc_stats.process_rss - server.cron_malloc_stats.zmalloc_used;
-    mh->allocator_frag =
-        (float)server.cron_malloc_stats.allocator_active / server.cron_malloc_stats.allocator_allocated;
-    mh->allocator_frag_bytes =
-        server.cron_malloc_stats.allocator_active - server.cron_malloc_stats.allocator_allocated;
+    /* Starting with redis 7.4, the lua memory is part of the total memory usage
+     * of redis, and that includes RSS and all other memory metrics. We only want
+     * to deduct it from active defrag. */
+    size_t frag_smallbins_bytes =
+        server.cron_malloc_stats.allocator_frag_smallbins_bytes - server.cron_malloc_stats.lua_allocator_frag_smallbins_bytes;
+    size_t allocated =
+        server.cron_malloc_stats.allocator_allocated - server.cron_malloc_stats.lua_allocator_allocated;
+    mh->allocator_frag = (float)frag_smallbins_bytes / allocated + 1;
+    mh->allocator_frag_bytes = frag_smallbins_bytes;
     mh->allocator_rss =
         (float)server.cron_malloc_stats.allocator_resident / server.cron_malloc_stats.allocator_active;
     mh->allocator_rss_bytes =
@@ -1217,6 +1210,9 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
             server.repl_backlog->blocks_index->numnodes * sizeof(raxNode) +
             raxSize(server.repl_backlog->blocks_index) * sizeof(void*);
     }
+
+    mh->replica_fullsync_buffer = server.repl_full_sync_buffer.mem_used;
+    mem_total += mh->replica_fullsync_buffer;
     mem_total += mh->repl_backlog;
     mem_total += mh->clients_slaves;
 
@@ -1238,30 +1234,43 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
     mh->aof_buffer = mem;
     mem_total+=mem;
 
-    mem = evalScriptsMemory();
-    mh->lua_caches = mem;
+    mem = evalScriptsMemoryEngine();
+    mh->eval_caches = mem;
     mem_total+=mem;
-    mh->functions_caches = functionsMemoryOverhead();
+    mh->functions_caches = functionsMemoryEngine();
     mem_total+=mh->functions_caches;
+
+    mh->script_vm = evalScriptsMemoryVM();
+    mh->script_vm += functionsMemoryVM();
+    mem_total+=mh->script_vm;
 
     for (j = 0; j < server.dbnum; j++) {
         redisDb *db = server.db+j;
-        unsigned long long keyscount = dbSize(db, DB_MAIN);
-        if (keyscount == 0) continue;
+        if (!kvstoreNumAllocatedDicts(db->keys)) continue;
+
+        unsigned long long keyscount = kvstoreSize(db->keys);
 
         mh->total_keys += keyscount;
         mh->db = zrealloc(mh->db,sizeof(mh->db[0])*(mh->num_dbs+1));
         mh->db[mh->num_dbs].dbid = j;
 
-        mem = dbMemUsage(db, DB_MAIN);
+        mem = kvstoreMemUsage(db->keys) +
+              keyscount * sizeof(robj);
         mh->db[mh->num_dbs].overhead_ht_main = mem;
         mem_total+=mem;
 
-        mem = dbMemUsage(db, DB_EXPIRES);
+        mem = kvstoreMemUsage(db->expires);
         mh->db[mh->num_dbs].overhead_ht_expires = mem;
         mem_total+=mem;
 
         mh->num_dbs++;
+
+        mh->overhead_db_hashtable_lut += kvstoreOverheadHashtableLut(db->keys);
+        mh->overhead_db_hashtable_lut += kvstoreOverheadHashtableLut(db->expires);
+        mh->overhead_db_hashtable_rehashing += kvstoreOverheadHashtableRehashing(db->keys);
+        mh->overhead_db_hashtable_rehashing += kvstoreOverheadHashtableRehashing(db->expires);
+        mh->db_dict_rehashing_count += kvstoreDictRehashingCount(db->keys);
+        mh->db_dict_rehashing_count += kvstoreDictRehashingCount(db->expires);
     }
 
     mh->overhead_total = mem_total;
@@ -1544,7 +1553,7 @@ NULL
                 return;
             }
         }
-        if ((de = dbFind(c->db, c->argv[2]->ptr, DB_MAIN)) == NULL) {
+        if ((de = dbFind(c->db, c->argv[2]->ptr)) == NULL) {
             addReplyNull(c);
             return;
         }
@@ -1555,7 +1564,7 @@ NULL
     } else if (!strcasecmp(c->argv[1]->ptr,"stats") && c->argc == 2) {
         struct redisMemOverhead *mh = getMemoryOverheadData();
 
-        addReplyMapLen(c,27+mh->num_dbs);
+        addReplyMapLen(c,33+mh->num_dbs);
 
         addReplyBulkCString(c,"peak.allocated");
         addReplyLongLong(c,mh->peak_allocated);
@@ -1568,6 +1577,9 @@ NULL
 
         addReplyBulkCString(c,"replication.backlog");
         addReplyLongLong(c,mh->repl_backlog);
+
+        addReplyBulkCString(c,"replica.fullsync.buffer");
+        addReplyLongLong(c,mh->replica_fullsync_buffer);
 
         addReplyBulkCString(c,"clients.slaves");
         addReplyLongLong(c,mh->clients_slaves);
@@ -1582,10 +1594,13 @@ NULL
         addReplyLongLong(c,mh->aof_buffer);
 
         addReplyBulkCString(c,"lua.caches");
-        addReplyLongLong(c,mh->lua_caches);
+        addReplyLongLong(c,mh->eval_caches);
 
         addReplyBulkCString(c,"functions.caches");
         addReplyLongLong(c,mh->functions_caches);
+
+        addReplyBulkCString(c,"script.VMs");
+        addReplyLongLong(c,mh->script_vm);
 
         for (size_t j = 0; j < mh->num_dbs; j++) {
             char dbname[32];
@@ -1600,8 +1615,17 @@ NULL
             addReplyLongLong(c,mh->db[j].overhead_ht_expires);
         }
 
+        addReplyBulkCString(c,"overhead.db.hashtable.lut");
+        addReplyLongLong(c, mh->overhead_db_hashtable_lut);
+
+        addReplyBulkCString(c,"overhead.db.hashtable.rehashing");
+        addReplyLongLong(c, mh->overhead_db_hashtable_rehashing);
+
         addReplyBulkCString(c,"overhead.total");
         addReplyLongLong(c,mh->overhead_total);
+
+        addReplyBulkCString(c,"db.dict.rehashing.count");
+        addReplyLongLong(c, mh->db_dict_rehashing_count);
 
         addReplyBulkCString(c,"keys.count");
         addReplyLongLong(c,mh->total_keys);
@@ -1626,6 +1650,9 @@ NULL
 
         addReplyBulkCString(c,"allocator.resident");
         addReplyLongLong(c,server.cron_malloc_stats.allocator_resident);
+
+        addReplyBulkCString(c,"allocator.muzzy");
+        addReplyLongLong(c,server.cron_malloc_stats.allocator_muzzy);
 
         addReplyBulkCString(c,"allocator-fragmentation.ratio");
         addReplyDouble(c,mh->allocator_frag);

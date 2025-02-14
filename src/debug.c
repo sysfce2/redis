@@ -1,31 +1,14 @@
 /*
- * Copyright (c) 2009-2020, Salvatore Sanfilippo <antirez at gmail dot com>
- * Copyright (c) 2020, Redis Labs, Inc
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
+ * Copyright (c) 2024-present, Valkey contributors.
+ * All rights reserved.
  *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
+ * Licensed under your choice of the Redis Source Available License 2.0
+ * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
  */
 
 #include "server.h"
@@ -35,8 +18,10 @@
 #include "bio.h"
 #include "quicklist.h"
 #include "fpconv_dtoa.h"
+#include "fast_float_strtod.h"
 #include "cluster.h"
 #include "threads_mngr.h"
+#include "script.h"
 
 #include <arpa/inet.h>
 #include <signal.h>
@@ -76,7 +61,6 @@ int bugReportStart(void);
 void printCrashReport(void);
 void bugReportEnd(int killViaSignal, int sig);
 void logStackTrace(void *eip, int uplevel, int current_thread);
-void dbGetStats(char *buf, size_t bufsize, redisDb *db, int full, dbKeyType keyType);
 void sigalrmSignalHandler(int sig, siginfo_t *info, void *secret);
 
 /* ================================= Debugging ============================== */
@@ -223,17 +207,22 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
         }
     } else if (o->type == OBJ_HASH) {
         hashTypeIterator *hi = hashTypeInitIterator(o);
-        while (hashTypeNext(hi) != C_ERR) {
+        while (hashTypeNext(hi, 0) != C_ERR) {
             unsigned char eledigest[20];
             sds sdsele;
 
+            /* field */
             memset(eledigest,0,20);
             sdsele = hashTypeCurrentObjectNewSds(hi,OBJ_HASH_KEY);
             mixDigest(eledigest,sdsele,sdslen(sdsele));
             sdsfree(sdsele);
+            /* val */
             sdsele = hashTypeCurrentObjectNewSds(hi,OBJ_HASH_VALUE);
             mixDigest(eledigest,sdsele,sdslen(sdsele));
             sdsfree(sdsele);
+            /* hash-field expiration (HFE) */
+            if (hi->expire_time != EB_EXPIRE_TIME_INVALID)
+                xorDigest(eledigest,"!!hexpire!!",11);
             xorDigest(digest,eledigest,20);
         }
         hashTypeReleaseIterator(hi);
@@ -290,15 +279,16 @@ void computeDatasetDigest(unsigned char *final) {
 
     for (j = 0; j < server.dbnum; j++) {
         redisDb *db = server.db+j;
-        if (dbSize(db, DB_MAIN) == 0) continue;
-        dbIterator *dbit = dbIteratorInit(db, DB_MAIN);
+        if (kvstoreSize(db->keys) == 0)
+            continue;
+        kvstoreIterator *kvs_it = kvstoreIteratorInit(db->keys);
 
         /* hash the DB id, so the same dataset moved in a different DB will lead to a different digest */
         aux = htonl(j);
         mixDigest(final,&aux,sizeof(aux));
 
         /* Iterate this DB writing every entry */
-        while((de = dbIteratorNext(dbit)) != NULL) {
+        while((de = kvstoreIteratorNext(kvs_it)) != NULL) {
             sds key;
             robj *keyobj, *o;
 
@@ -315,7 +305,7 @@ void computeDatasetDigest(unsigned char *final) {
             xorDigest(final,digest,20);
             decrRefCount(keyobj);
         }
-        dbReleaseIterator(dbit);
+        kvstoreIteratorRelease(kvs_it);
     }
 }
 
@@ -407,6 +397,8 @@ void debugCommand(client *c) {
 "    Hard crash and restart after a <milliseconds> delay (default 0).",
 "DIGEST",
 "    Output a hex signature representing the current DB content.",
+"INTERNAL_SECRET",
+"    Return the cluster internal secret (hashed with crc16) or error if not in cluster mode.",
 "DIGEST-VALUE <key> [<key> ...]",
 "    Output a hex signature of the values of all the specified keys.",
 "ERROR <string>",
@@ -467,9 +459,9 @@ void debugCommand(client *c) {
 "SEGFAULT",
 "    Crash the server with sigsegv.",
 "SET-ACTIVE-EXPIRE <0|1>",
-"    Setting it to 0 disables expiring keys in background when they are not",
-"    accessed (otherwise the Redis behavior). Setting it to 1 reenables back the",
-"    default.",
+"    Setting it to 0 disables expiring keys (and hash-fields) in background ",
+"    when they are not accessed (otherwise the Redis behavior). Setting it",
+"    to 1 reenables back the default.",
 "QUICKLIST-PACKED-THRESHOLD <size>",
 "    Sets the threshold for elements to be inserted as plain vs packed nodes",
 "    Default value is 1GB, allows values up to 4GB. Setting to 0 restores to default.",
@@ -496,6 +488,14 @@ void debugCommand(client *c) {
 "    In case RESET is provided the peak reset time will be restored to the default value",
 "REPLYBUFFER RESIZING <0|1>",
 "    Enable or disable the reply buffer resize cron job",
+"REPL-PAUSE <clear|after-fork|before-rdb-channel|on-streaming-repl-buf>",
+"    Pause the server's main process during various replication steps.",
+"DICT-RESIZING <0|1>",
+"    Enable or disable the main dict and expire dict resizing.",
+"SCRIPT <LIST|<sha>>",
+"    Output SHA and content of all scripts or of a specific script with its SHA.",
+"MARK-INTERNAL-CLIENT [UNMARK]",
+"    Promote the current connection to an internal connection.",
 NULL
         };
         addExtendedReplyHelp(c, help, clusterDebugCommandExtendedHelp());
@@ -577,6 +577,7 @@ NULL
             addReplyError(c,"Error trying to load the RDB dump, check server logs.");
             return;
         }
+        applyAppendOnlyConfig(); /* Check if AOF config was changed while loading */
         serverLog(LL_NOTICE,"DB reloaded by DEBUG RELOAD");
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"loadaof")) {
@@ -592,6 +593,7 @@ NULL
             addReplyError(c, "Error trying to load the AOF files, check server logs.");
             return;
         }
+        applyAppendOnlyConfig(); /* Check if AOF config was changed while loading */
         server.dirty = 0; /* Prevent AOF / replication */
         serverLog(LL_NOTICE,"Append Only File loaded by DEBUG LOADAOF");
         addReply(c,shared.ok);
@@ -606,7 +608,7 @@ NULL
         robj *val;
         char *strenc;
 
-        if ((de = dbFind(c->db, c->argv[2]->ptr, DB_MAIN)) == NULL) {
+        if ((de = dbFind(c->db, c->argv[2]->ptr)) == NULL) {
             addReplyErrorObject(c,shared.nokeyerr);
             return;
         }
@@ -658,7 +660,7 @@ NULL
         robj *val;
         sds key;
 
-        if ((de = dbFind(c->db, c->argv[2]->ptr, DB_MAIN)) == NULL) {
+        if ((de = dbFind(c->db, c->argv[2]->ptr)) == NULL) {
             addReplyErrorObject(c,shared.nokeyerr);
             return;
         }
@@ -684,10 +686,14 @@ NULL
         if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nokeyerr))
                 == NULL) return;
 
-        if (o->encoding != OBJ_ENCODING_LISTPACK) {
+        if (o->encoding != OBJ_ENCODING_LISTPACK && o->encoding != OBJ_ENCODING_LISTPACK_EX) {
             addReplyError(c,"Not a listpack encoded object.");
         } else {
-            lpRepr(o->ptr);
+            if (o->encoding == OBJ_ENCODING_LISTPACK)
+                lpRepr(o->ptr);
+            else if (o->encoding == OBJ_ENCODING_LISTPACK_EX)
+                lpRepr(((listpackEx*)o->ptr)->lp);
+
             addReplyStatus(c,"Listpack structure printed on stdout");
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"quicklist") && (c->argc == 3 || c->argc == 4)) {
@@ -719,7 +725,7 @@ NULL
             return;
         }
 
-        if (dbExpand(c->db, keys, DB_MAIN, 1) == C_ERR) {
+        if (dbExpand(c->db, keys, 1) == C_ERR) {
             addReplyError(c, "OOM in dictTryExpand");
             return;
         }
@@ -757,6 +763,15 @@ NULL
         for (int i = 0; i < 20; i++) d = sdscatprintf(d, "%02x",digest[i]);
         addReplyStatus(c,d);
         sdsfree(d);
+    } else if (!strcasecmp(c->argv[1]->ptr,"internal_secret") && c->argc == 2) {
+        size_t len;
+        const char *internal_secret = clusterGetSecret(&len);
+        if (!internal_secret) {
+            addReplyError(c, "Internal secret is missing");
+        } else {
+            uint16_t hash = crc16(internal_secret, len);
+            addReplyLongLong(c, hash);
+        }
     } else if (!strcasecmp(c->argv[1]->ptr,"digest-value") && c->argc >= 2) {
         /* DEBUG DIGEST-VALUE key key key ... key. */
         addReplyArrayLen(c,c->argc-2);
@@ -767,7 +782,7 @@ NULL
             /* We don't use lookupKey because a debug command should
              * work on logically expired keys */
             dictEntry *de;
-            robj *o = ((de = dbFind(c->db, c->argv[j]->ptr, DB_MAIN)) == NULL) ? NULL : dictGetVal(de);
+            robj *o = ((de = dbFind(c->db, c->argv[j]->ptr)) == NULL) ? NULL : dictGetVal(de);
             if (o) xorObjectDigest(c->db,c->argv[j],digest,o);
 
             sds d = sdsempty();
@@ -837,7 +852,7 @@ NULL
             addReplyError(c,"Wrong protocol type name. Please use one of the following: string|integer|double|bignum|null|array|set|map|attrib|push|verbatim|true|false");
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"sleep") && c->argc == 3) {
-        double dtime = strtod(c->argv[2]->ptr,NULL);
+        double dtime = fast_float_strtod(c->argv[2]->ptr,NULL);
         long long utime = dtime*1000000;
         struct timespec tv;
 
@@ -855,7 +870,7 @@ NULL
     {
         int memerr;
         unsigned long long sz = memtoull((const char *)c->argv[2]->ptr, &memerr);
-        if (memerr || !quicklistisSetPackedThreshold(sz)) {
+        if (memerr || !quicklistSetPackedThreshold(sz)) {
             addReplyError(c, "argument must be a memory value bigger than 1 and smaller than 4gb");
         } else {
             addReply(c,shared.ok);
@@ -911,11 +926,11 @@ NULL
             full = 1;
 
         stats = sdscatprintf(stats,"[Dictionary HT]\n");
-        dbGetStats(buf, sizeof(buf), &server.db[dbid], full, DB_MAIN);
+        kvstoreGetStats(server.db[dbid].keys, buf, sizeof(buf), full);
         stats = sdscat(stats,buf);
 
         stats = sdscatprintf(stats,"[Expires HT]\n");
-        dbGetStats(buf, sizeof(buf), &server.db[dbid], full, DB_EXPIRES);
+        kvstoreGetStats(server.db[dbid].expires, buf, sizeof(buf), full);
         stats = sdscat(stats,buf);
 
         addReplyVerbatim(c,stats,sdslen(stats),"txt");
@@ -1021,6 +1036,57 @@ NULL
             return;
         }
         addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr, "repl-pause") && c->argc == 3) {
+        if (!strcasecmp(c->argv[2]->ptr, "clear")) {
+            server.repl_debug_pause = REPL_DEBUG_PAUSE_NONE;
+        } else if (!strcasecmp(c->argv[2]->ptr,"after-fork")) {
+            server.repl_debug_pause |= REPL_DEBUG_AFTER_FORK;
+        } else if (!strcasecmp(c->argv[2]->ptr,"before-rdb-channel")) {
+            server.repl_debug_pause |= REPL_DEBUG_BEFORE_RDB_CHANNEL;
+        } else if (!strcasecmp(c->argv[2]->ptr, "on-streaming-repl-buf")) {
+            server.repl_debug_pause |= REPL_DEBUG_ON_STREAMING_REPL_BUF;
+        } else {
+            addReplySubcommandSyntaxError(c);
+            return;
+        }
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr, "dict-resizing") && c->argc == 3) {
+        server.dict_resizing = atoi(c->argv[2]->ptr);
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"script") && c->argc == 3) {
+        if (!strcasecmp(c->argv[2]->ptr,"list")) {
+            dictIterator *di = dictGetIterator(evalScriptsDict());
+            dictEntry *de;
+            while ((de = dictNext(di)) != NULL) {
+                luaScript *script = dictGetVal(de);
+                sds *sha = dictGetKey(de);
+                serverLog(LL_WARNING, "SCRIPT SHA: %s\n%s", (char*)sha, (char*)script->body->ptr);
+            }
+            dictReleaseIterator(di);
+        } else if (sdslen(c->argv[2]->ptr) == 40) {
+            dictEntry *de;
+            if ((de = dictFind(evalScriptsDict(), c->argv[2]->ptr)) == NULL) {
+                addReplyErrorObject(c, shared.noscripterr);
+                return;
+            }
+            luaScript *script = dictGetVal(de);
+            serverLog(LL_WARNING, "SCRIPT SHA: %s\n%s", (char*)c->argv[2]->ptr, (char*)script->body->ptr);
+        } else {
+            addReplySubcommandSyntaxError(c);
+            return;
+        }
+        addReply(c,shared.ok);
+    } else if(!strcasecmp(c->argv[1]->ptr,"mark-internal-client") && c->argc < 4) {
+        if (c->argc == 2) {
+            c->flags |= CLIENT_INTERNAL;
+            addReply(c, shared.ok);
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr, "unmark")) {
+            c->flags &= ~CLIENT_INTERNAL;
+            addReply(c, shared.ok);
+        } else {
+            addReplySubcommandSyntaxError(c);
+            return;
+        }
     } else if(!handleDebugClusterCommand(c)) {
         addReplySubcommandSyntaxError(c);
         return;
@@ -1028,6 +1094,46 @@ NULL
 }
 
 /* =========================== Crash handling  ============================== */
+
+/* When hide-user-data-from-log is enabled, to avoid leaking user info, we only
+ * print tokens of the current command into the log. First, we collect command
+ * tokens into this struct (Commands tokens are defined in json schema). Later,
+ * checking each argument against the token list. */
+#define CMD_TOKEN_MAX_COUNT 128 /* Max token count in a command's json schema */
+struct cmdToken {
+    const char *tokens[CMD_TOKEN_MAX_COUNT];
+    int n_token;
+};
+
+/* Collect tokens from command arguments recursively. */
+static void cmdTokenCollect(struct cmdToken *tk, redisCommandArg *args, int argc) {
+    if (args == NULL)
+        return;
+
+    for (int i = 0; i < argc && tk->n_token < CMD_TOKEN_MAX_COUNT; i++) {
+        if (args[i].token)
+            tk->tokens[tk->n_token++] = args[i].token;
+        cmdTokenCollect(tk, args[i].subargs, args[i].num_args);
+    }
+}
+
+/* Get tokens of the command. */
+static void cmdTokenGetFromCommand(struct cmdToken *tk, struct redisCommand *cmd) {
+    tk->n_token = 0;
+    cmdTokenCollect(tk, cmd->args, cmd->num_args);
+}
+
+/* Check if object is one of command's tokens. */
+static int cmdTokenCheck(struct cmdToken *tk, robj *o) {
+    if (o->type != OBJ_STRING || !sdsEncodedObject(o))
+        return 0;
+
+    for (int i = 0; i < tk->n_token; i++) {
+        if (strcasecmp(tk->tokens[i], o->ptr) == 0)
+            return 1;
+    }
+    return 0;
+}
 
 __attribute__ ((noinline))
 void _serverAssert(const char *estr, const char *file, int line) {
@@ -1052,15 +1158,31 @@ void _serverAssert(const char *estr, const char *file, int line) {
 void _serverAssertPrintClientInfo(const client *c) {
     int j;
     char conninfo[CONN_INFO_LEN];
+    struct redisCommand *cmd = NULL;
+    struct cmdToken tokens = {{0}};
 
     bugReportStart();
     serverLog(LL_WARNING,"=== ASSERTION FAILED CLIENT CONTEXT ===");
     serverLog(LL_WARNING,"client->flags = %llu", (unsigned long long) c->flags);
     serverLog(LL_WARNING,"client->conn = %s", connGetInfo(c->conn, conninfo, sizeof(conninfo)));
     serverLog(LL_WARNING,"client->argc = %d", c->argc);
+    if (server.hide_user_data_from_log) {
+        cmd = lookupCommand(c->argv, c->argc);
+        if (cmd)
+            cmdTokenGetFromCommand(&tokens, cmd);
+    }
+
     for (j=0; j < c->argc; j++) {
         char buf[128];
         char *arg;
+
+        /* Allow command name, subcommand name and command tokens in the log. */
+        if (server.hide_user_data_from_log && (j != 0 && !(j == 1 && cmd && cmd->parent))) {
+            if (!cmdTokenCheck(&tokens, c->argv[j])) {
+                serverLog(LL_WARNING, "client->argv[%d] = *redacted*", j);
+                continue;
+            }
+        }
 
         if (c->argv[j]->type == OBJ_STRING && sdsEncodedObject(c->argv[j])) {
             arg = (char*) c->argv[j]->ptr;
@@ -1098,7 +1220,7 @@ void serverLogObjectDebugInfo(const robj *o) {
     } else if (o->type == OBJ_SET) {
         serverLog(LL_WARNING,"Set size: %d", (int) setTypeSize(o));
     } else if (o->type == OBJ_HASH) {
-        serverLog(LL_WARNING,"Hash size: %d", (int) hashTypeLength(o));
+        serverLog(LL_WARNING,"Hash size: %d", (int) hashTypeLength(o, 0));
     } else if (o->type == OBJ_ZSET) {
         serverLog(LL_WARNING,"Sorted set size: %d", (int) zsetLength(o));
         if (o->encoding == OBJ_ENCODING_SKIPLIST)
@@ -1257,6 +1379,10 @@ static void* getAndSetMcontextEip(ucontext_t *uc, void *eip) {
 
 REDIS_NO_SANITIZE("address")
 void logStackContent(void **sp) {
+    if (server.hide_user_data_from_log) {
+        serverLog(LL_NOTICE,"hide-user-data-from-log is on, skip logging stack content to avoid spilling PII.");
+        return;
+    }
     int i;
     for (i = 15; i >= 0; i--) {
         unsigned long addr = (unsigned long) sp+i;
@@ -2025,16 +2151,31 @@ void logCurrentClient(client *cc, const char *title) {
 
     sds client;
     int j;
+    struct redisCommand *cmd = NULL;
+    struct cmdToken tokens = {{0}};
 
     serverLog(LL_WARNING|LL_RAW, "\n------ %s CLIENT INFO ------\n", title);
     client = catClientInfoString(sdsempty(),cc);
     serverLog(LL_WARNING|LL_RAW,"%s\n", client);
     sdsfree(client);
     serverLog(LL_WARNING|LL_RAW,"argc: '%d'\n", cc->argc);
+    if (server.hide_user_data_from_log) {
+        cmd = lookupCommand(cc->argv, cc->argc);
+        if (cmd)
+            cmdTokenGetFromCommand(&tokens, cmd);
+    }
+
     for (j = 0; j < cc->argc; j++) {
+        /* Allow command name, subcommand name and command tokens in the log. */
+        if (server.hide_user_data_from_log && (j != 0 && !(j == 1 && cmd && cmd->parent))) {
+            if (!cmdTokenCheck(&tokens, cc->argv[j])) {
+                serverLog(LL_WARNING|LL_RAW, "argv[%d]: '*redacted*'\n", j);
+                continue;
+            }
+        }
         robj *decoded;
         decoded = getDecodedObject(cc->argv[j]);
-        sds repr = sdscatrepr(sdsempty(),decoded->ptr, min(sdslen(decoded->ptr), 128));
+        sds repr = sdscatrepr(sdsempty(),decoded->ptr, min(sdslen(decoded->ptr), 1024));
         serverLog(LL_WARNING|LL_RAW,"argv[%d]: '%s'\n", j, (char*)repr);
         if (!strcasecmp(decoded->ptr, "auth") || !strcasecmp(decoded->ptr, "auth2")) {
             sdsfree(repr);
@@ -2051,7 +2192,7 @@ void logCurrentClient(client *cc, const char *title) {
         dictEntry *de;
 
         key = getDecodedObject(cc->argv[1]);
-        de = dbFind(cc->db, key->ptr, DB_MAIN);
+        de = dbFind(cc->db, key->ptr);
         if (de) {
             val = dictGetVal(de);
             serverLog(LL_WARNING,"key '%s' found in DB containing the following object:", (char*)key->ptr);
@@ -2353,6 +2494,8 @@ void removeSigSegvHandlers(void) {
 }
 
 void printCrashReport(void) {
+    server.crashing = 1;
+
     /* Log INFO and CLIENT LIST */
     logServerInfo();
 
@@ -2481,6 +2624,12 @@ void applyWatchdogPeriod(void) {
         if (server.watchdog_period < min_period) server.watchdog_period = min_period;
         watchdogScheduleSignal(server.watchdog_period); /* Adjust the current timer. */
     }
+}
+
+void debugPauseProcess(void) {
+    serverLog(LL_NOTICE, "Process is about to stop.");
+    raise(SIGSTOP);
+    serverLog(LL_NOTICE, "Process has been continued.");
 }
 
 /* Positive input is sleep time in microseconds. Negative input is fractions
